@@ -47,7 +47,7 @@ Direct firmware load failed with error -2
 ### **Option 1: Offline (recommended for systems without internet)**
 1. Clone or download this repository on a machine with internet:
    ```bash
-   git clone https://github.com/<your-username>/bcm43602-mbp-linux.git
+   git clone https://github.com/nilz90/bcm43602-mbp-linux.git
    cd bcm43602-mbp-linux
    ```
 2. Transfer the folder to your target machine (USB stick, etc.).
@@ -62,7 +62,7 @@ Direct firmware load failed with error -2
 
 ### **Option 2: Online**
 ```bash
-git clone https://github.com/<your-username>/bcm43602-mbp-linux.git
+git clone https://github.com/nilz90/bcm43602-mbp-linux.git
 cd bcm43602-mbp-linux
 sudo ./install-bcm43602-mbp.sh --reload
 ```
