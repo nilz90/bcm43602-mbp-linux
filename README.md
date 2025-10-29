@@ -71,9 +71,9 @@ sudo ./install-bcm43602-mbp.sh --reload
 - `--offline` → Use vendored files only (no package installation).
 - `--reload` → Attempt soft reload of Wi-Fi module (instead of reboot).
 - `--no-regdom` → Skip setting regulatory domain.
-- `--nm-backend=auto|iwd|wpa` → **NEW FEATURE**: Configure NetworkManager Wi-Fi backend.
+- `--nm-backend=auto|iwd|wpa` → Configure NetworkManager Wi-Fi backend.
 
-### 🔍 New Feature: NetworkManager Backend Control
+### 🔍  NetworkManager Backend Control
 Arch-based systems (like CachyOS, Manjaro, EndeavourOS) often run **iwd** alongside NetworkManager or default to `wpa_supplicant`. This can cause Wi-Fi association failures even if firmware loads correctly.
 
 The installer now supports automatic or manual backend configuration:
