@@ -1,11 +1,18 @@
 #!/usr/bin/env bash
-# Offline-first, idempotent installer for BCM43602 (MacBook Pro 2016/2017)
+# Offline-first, idempotent installer for Broadcom BCM43602 (MacBook Pro 2016/2017)
 # - Uses vendored firmware/.txt from ./firmware first (no internet needed)
 # - Falls back to linux-firmware packages when not in --offline mode
-# - Idempotent & restart-safe; atomic .txt replace w/ MAC injection
-# Licensing: Broadcom/Cypress Wi-Fi firmware is redistributable in binary form,
-# unmodified, with license included. See firmware/LICENSE.Broadcom-wifi.
-# Refs: Linux Wireless (firmware from linux-firmware): https://wireless.docs.kernel.org/.../brcm80211.html
+# - Injects real MAC into NVRAM .txt (atomic replace with backup)
+# - Optionally sets regulatory domain (DE)
+# - NEW: Configures NetworkManager Wi-Fi backend (auto|iwd|wpa) to avoid iwd/wpa_supplicant conflicts
+# - Optional soft reload (--reload), else suggests reboot
+#
+# Firmware redistribution per Broadcom Binary Redistribution License (unmodified binary + license included).
+# See: firmware/LICENSE.Broadcom-wifi
+#
+# Refs (for background):
+# - Linux Wireless: brcmfmac requires firmware from linux-firmware
+# - Debian brcmfmac: firmware via distro packages
 
 set -Eeuo pipefail
 
@@ -17,22 +24,13 @@ BIN_SYS="${FW_DIR_SYS}/brcmfmac43602-pcie.bin"
 BIN_REPO="${FW_DIR_REPO}/brcmfmac43602-pcie.bin"
 TXT_SYS="${FW_DIR_SYS}/brcmfmac43602-pcie.txt"
 TXT_REPO="${FW_DIR_REPO}/brcmfmac43602-pcie.txt"
-
 BIN_ZST_SYS="${FW_DIR_SYS}/brcmfmac43602-pcie.bin.zst"
 
 DO_REGDOM=1
 TRY_RELOAD=0
 OFFLINE=0
+NM_BACKEND="auto"   # auto | iwd | wpa
 LOCK_FILE="/var/lock/install-bcm43602.lock"
-
-for arg in "${@:-}"; do
-  case "$arg" in
-    --no-regdom) DO_REGDOM=0 ;;
-    --reload)    TRY_RELOAD=1 ;;
-    --offline)   OFFLINE=1 ;;
-    *) echo "Unknown option: $arg"; exit 2 ;;
-  esac
-done
 
 say(){ echo -e "[BCM43602] $*"; }
 die(){ echo -e "[BCM43602] ERROR: $*" >&2; exit 1; }
@@ -40,12 +38,23 @@ cleanup(){ rm -f "$LOCK_FILE" 2>/dev/null || true; }
 trap cleanup EXIT
 trap 'say "Fehler aufgetreten. Du kannst das Skript **einfach erneut** starten – es ist idempotent."' ERR
 
+# -------- Argumente --------
+for arg in "${@:-}"; do
+  case "$arg" in
+    --no-regdom) DO_REGDOM=0 ;;
+    --reload)    TRY_RELOAD=1 ;;
+    --offline)   OFFLINE=1 ;;
+    --nm-backend=*) NM_BACKEND="${arg#*=}" ;;  # auto|iwd|wpa
+    *) echo "Unknown option: $arg"; exit 2 ;;
+  esac
+done
+
 need_root(){ [[ $EUID -eq 0 ]] || die "Bitte mit sudo/root ausführen."; }
 lock(){ if ! ( set -o noclobber; echo "$$" > "$LOCK_FILE" ) 2>/dev/null; then die "Läuft bereits (Lock: $LOCK_FILE)."; fi; }
 
 detect_pm(){
-  if command -v apt >/dev/null 2>&1;    then echo apt;    return; fi
-  if command -v dnf >/dev/null 2>&1;    then echo dnf;    return; fi
+  if command -v apt    >/dev/null 2>&1; then echo apt;    return; fi
+  if command -v dnf    >/dev/null 2>&1; then echo dnf;    return; fi
   if command -v pacman >/dev/null 2>&1; then echo pacman; return; fi
   if command -v zypper >/dev/null 2>&1; then echo zypper; return; fi
   echo ""
@@ -154,6 +163,69 @@ set_regdom(){
     say "Hinweis: Für Legacy-Setups REGDOMAIN=DE in /etc/default/crda setzen."
 }
 
+# -------- NetworkManager Backend (iwd vs. wpa_supplicant) --------
+nm_is_present() {
+  command -v nmcli >/dev/null 2>&1 || return 1
+  systemctl list-unit-files | grep -q '^NetworkManager\.service' || return 1
+  return 0
+}
+service_active()  { systemctl is-active   --quiet "$1" 2>/dev/null; }
+service_enabled() { systemctl is-enabled  --quiet "$1" 2>/dev/null; }
+service_exists()  { systemctl list-unit-files | grep -q "^$1"; }
+
+write_nm_backend_conf() {
+  local backend="$1"  # iwd oder wpa_supplicant
+  mkdir -p /etc/NetworkManager/conf.d
+  local conf="/etc/NetworkManager/conf.d/10-wifi-backend.conf"
+  local tmp; tmp=$(mktemp)
+  cat > "$tmp" <<EOF
+[device]
+wifi.backend=${backend}
+EOF
+  if [[ -f "$conf" ]] && cmp -s "$tmp" "$conf"; then
+    rm -f "$tmp"
+    say "NM backend bereits '${backend}' – keine Änderung."
+  else
+    [[ -f "$conf" ]] && cp -a "$conf" "${conf}.bak.$(date +%Y%m%d-%H%M%S)"
+    mv -f "$tmp" "$conf"
+    say "NM backend gesetzt: ${backend} → ${conf}"
+  fi
+}
+
+ensure_nm_backend() {
+  nm_is_present || { say "NetworkManager nicht gefunden – Backend‑Check übersprungen."; return 0; }
+
+  local target=""
+  case "$NM_BACKEND" in
+    auto)
+      if service_exists iwd.service && ( service_active iwd.service || service_enabled iwd.service ); then
+        target="iwd"
+      else
+        target="wpa_supplicant"
+      fi
+      ;;
+    iwd) target="iwd" ;;
+    wpa) target="wpa_supplicant" ;;
+    *)   say "Unbekannter NM-Backend-Wert: $NM_BACKEND – verwende auto"; target="wpa_supplicant" ;;
+  esac
+
+  if [[ "$target" == "iwd" ]]; then
+    write_nm_backend_conf "iwd"
+    if service_exists iwd.service; then
+      systemctl enable --now iwd 2>/dev/null || true
+    fi
+    systemctl stop wpa_supplicant 2>/dev/null || true
+  else
+    write_nm_backend_conf "wpa_supplicant"
+    if service_exists iwd.service; then
+      systemctl disable --now iwd 2>/dev/null || true
+    fi
+  fi
+  say "Starte NetworkManager neu, damit der WLAN-Backend aktiv wird ..."
+  systemctl restart NetworkManager || say "Hinweis: Konnte NetworkManager nicht neu starten."
+  nmcli --version >/dev/null 2>&1 && nmcli radio || true
+}
+
 soft_reload(){
   say "Versuche sanften Reload ..."
   systemctl stop NetworkManager 2>/dev/null || true
@@ -184,9 +256,15 @@ main(){
   mkdir -p "$FW_DIR_SYS"; replace_if_changed "$tmp" "$TXT_SYS"
 
   set_regdom
+  ensure_nm_backend
+
   [[ $TRY_RELOAD -eq 1 ]] && soft_reload "$iface" || true
   postcheck
-  [[ $TRY_RELOAD -eq 0 ]] && { echo; say "Empfehlung: **Neustart** (sudo reboot)"; }
+
+  if [[ $TRY_RELOAD -eq 0 ]]; then
+    echo; say "Empfehlung: **Neustart**, damit alle Änderungen sicher greifen. (sudo reboot)"
+  fi
 }
 
 main "$@"
+``
